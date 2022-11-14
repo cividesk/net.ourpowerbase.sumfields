@@ -325,6 +325,10 @@ function sumfields_civicrm_triggerInfo(&$info, $tableName) {
     // Iterate over all our fields, and build out a sql parts array
     foreach($custom_fields as $base_column_name => $params) {
       if(!in_array($base_column_name, $active_fields)) continue;
+      if(!array_key_exists($base_column_name, $custom['fields'])) {
+        Civi::log()->debug("The $base_column_name field has been yanked, re-save custom field definitions. ");
+        continue;
+      }
 
       // Multi-triggers custom fields (ie. based on relationships)
       // - calculated_contact_id is either NEW.contact_id (default) or the field or subquery used in the trigger
@@ -378,7 +382,7 @@ function sumfields_civicrm_triggerInfo(&$info, $tableName) {
         // WHERE id = NEW.contribution_id)). How it is calculated varies
         // depending on the table. This code abstracts that process - so you
         // simply need to add it to custom.php.
-        if ($calculated_id == 'NEW.contact_id') {
+        if ($calculated_contact_id == 'NEW.contact_id') {
 	  $pre_sql = $post_sql = '';
 	} else {
           // Wrap this trigger around an if/then to ensure we only execute if we
@@ -413,6 +417,7 @@ function sumfields_civicrm_triggerInfo(&$info, $tableName) {
         'sql' => $sql,
       );
     }
+
   }
 }
 
@@ -569,6 +574,7 @@ function sumfields_generate_data_based_on_current_data($session = NULL) {
     } // foreach trigger
 
   }
+
   if(empty($temp_sql)) {
     // Is this an error? Not sure. But it will be an error if we let this
     // function continue - it will produce a broken sql statement, so we
