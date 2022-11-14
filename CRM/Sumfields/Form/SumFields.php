@@ -17,7 +17,9 @@ class CRM_Sumfields_Form_SumFields extends CRM_Core_Form {
       $optgroup = $v['optgroup'];
       $fieldsets[$custom['optgroups'][$optgroup]['fieldset']]["active_{$optgroup}_fields"] = CRM_Utils_Array::value('description', $custom['optgroups'][$optgroup]);
       $field_options[$optgroup][$k] = $v['label'];
-      $trigger_tables[$v['trigger_table']] = FALSE;
+      foreach ($v['triggers'] as $trigger) {
+        $trigger_tables[$trigger['trigger_table']] = FALSE;
+      }
     }
     // Evaluate the status of form changes and report to the user
     $apply_settings_status = sumfields_get_setting('generate_schema_and_data', FALSE);

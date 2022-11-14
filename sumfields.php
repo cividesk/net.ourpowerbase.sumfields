@@ -303,25 +303,38 @@ function sumfields_civicrm_triggerInfo(&$info, $tableName) {
     // Iterate over all our fields, and build out a sql parts array
     foreach($custom_fields as $base_column_name => $params) {
       if(!in_array($base_column_name, $active_fields)) continue;
-      $table = $custom['fields'][$base_column_name]['trigger_table'];
-      if(!is_null($tableName) && $tableName != $table) {
-        // if triggerInfo is called with particular table name, we should
-        // only respond if we are contributing triggers to that table.
-        continue;
-      }
-      $trigger = $custom['fields'][$base_column_name]['trigger_sql'];
-      $trigger = sumfields_sql_rewrite($trigger);
-      // If we fail to properly rewrite the sql, don't set the trigger
-      // to avoid sql exceptions.
-      if(FALSE === $trigger) {
-        $msg = sprintf(E::ts("Failed to rewrite sql for %s field."), $base_column_name);
-        $session->setStatus($msg);
-        continue;
-      }
-      $sql_field_parts[$table][] = '`' . $params['column_name'] . '` = ' .
-        $trigger;
-      // Keep track of which tables we need to build triggers for.
-      if(!in_array($table, $tables)) $tables[] = $table;
+
+      // Multi-triggers custom fields (ie. based on relationships)
+      // - calculated_contact_id is either NEW.contact_id (default) or the field or subquery used in the trigger
+      // - each distinct calculated_contact_id will lead to a new UPDATE statement in the trigger (time consuming)
+      // - calculated_contact_id must be a unique value (ie. the query cannot return multiple values)
+      $field = $custom['fields'][$base_column_name];
+      foreach ($field['triggers'] as $trigger) {
+        $table = $trigger['trigger_table'];
+        if(!is_null($tableName) && $tableName != $table) {
+          // if triggerInfo is called with particular table name, we should
+          // only respond if we are contributing triggers to that table.
+          continue;
+        }
+        $sql = $trigger['trigger_sql'];
+        $sql = sumfields_sql_rewrite($sql);
+        // If we fail to properly rewrite the sql, don't set the trigger
+        // to avoid sql exceptions.
+        if(FALSE === $sql) {
+          $msg = sprintf(E::ts("Failed to rewrite sql for %s field."), $base_column_name);
+          $session->setStatus($msg);
+          continue;
+        }
+
+        // calculated_contact_id is (the list of) contacts for which we re-calculate the custom fields
+        // Note that we can have different contacts updated for different fields (ie. NEW.contact_id_a, NEW.contact_id_b)
+        // hence the [$calculated_contact_id] subindex in the assignment below
+        $calculated_contact_id = CRM_Utils_Array::value('calculated_contact_id', $trigger, 'NEW.contact_id');
+        $sql_field_parts[$table][$calculated_contact_id][] = '`' . $params['column_name'] . '` = ' .  $sql;
+
+        // Keep track of which tables we need to build triggers for.
+        if(!in_array($table, $tables)) $tables[] = $table;
+      } // Multi-trigger fields
     }
 
     // Iterate over each table that needs a trigger, build the trigger's
@@ -329,36 +342,32 @@ function sumfields_civicrm_triggerInfo(&$info, $tableName) {
     foreach ($tables as $table) {
       // Most tables don't need to be enclosed in an if/then statement,
       // so pre_sql and post_sql are null.
-      $pre_sql = NULL;
-      $post_sql = NULL;
+      $sql = '';
 
-      $parts = $sql_field_parts[$table];
+      // Multi-trigger fields, one table can have multiple $calculated_contact_id
+      // so we will need to create one UPDATE queries for each to act as entity_id
+      foreach ($sql_field_parts[$table] as $calculated_contact_id => $parts) {
 
-      // Most trigger tables have the contact_id field so calculating the
-      // contact_id is as easy as referencing NEW.contact_id. However,
-      // some trigger tables (e.g. civicrm_line_item) don't have contact_id
-      // so triggers based on these tables have to calculate the value of
-      // the contact_id (e.g. (SELECT contact_id FROM civicrm_contribution
-      // WHERE id = NEW.contribution_id)). How it is calculated varies
-      // depending on the table. This code abstracts that process - so you
-      // simply need to add it to custom.php.
-      if (isset($custom['tables'][$table]['calculated_contact_id'])) {
-        $calculated_contact_id = $custom['tables'][$table]['calculated_contact_id'];
+        // Most trigger tables have the contact_id field so calculating the
+        // contact_id is as easy as referencing NEW.contact_id. However,
+        // some trigger tables (e.g. civicrm_line_item) don't have contact_id
+        // so triggers based on these tables have to calculate the value of
+        // the contact_id (e.g. (SELECT contact_id FROM civicrm_contribution
+        // WHERE id = NEW.contribution_id)). How it is calculated varies
+        // depending on the table. This code abstracts that process - so you
+        // simply need to add it to custom.php.
+        if ($calculated_id == 'NEW.contact_id') {
+	  $pre_sql = $post_sql = '';
+	} else {
+          // Wrap this trigger around an if/then to ensure we only execute if we
+          // can calculate the contact_id.
+          $pre_sql = " IF $calculated_contact_id IS NOT NULL\nTHEN\n";
+          $post_sql = " END IF;";
+	}
 
-        // Wrap this trigger around an if/then to ensure we only execute if we
-        // can calculate the contact_id.
-        $pre_sql = " IF $calculated_contact_id IS NOT NULL\nTHEN\n";
-        $post_sql = " END IF;";
-      }
-      else {
-        // Choose the default.
-        $calculated_contact_id = 'NEW.contact_id';
-      }
-
-      $parts[] = "entity_id = $calculated_contact_id";
-
-      $extra_sql = implode(',', $parts);
-      $sql = $pre_sql . $generic_sql . $extra_sql . ' ON DUPLICATE KEY UPDATE ' . $extra_sql . ';' . $post_sql;
+	$fields_sql = implode(',', $parts);
+        $sql .= $pre_sql . $generic_sql . "entity_id = $calculated_contact_id, " . $fields_sql . ' ON DUPLICATE KEY UPDATE ' . $fields_sql . ';' . $post_sql;
+      } // Multi-trigger fields
 
       // We want to fire this trigger on insert, update and delete.
       $info[] = array(
@@ -382,7 +391,6 @@ function sumfields_civicrm_triggerInfo(&$info, $tableName) {
         'sql' => $sql,
       );
     }
-
   }
 }
 
@@ -411,19 +419,22 @@ function sumfields_create_temporary_table($trigger_table) {
     // Avoid error - make sure we have a definition for this field.
     if(array_key_exists($field_name, $definitions)) {
       $field_definition = $definitions[$field_name];
-      if($field_definition['trigger_table'] == $trigger_table) {
-        $data_type = $field_definition['data_type'];
-        if($data_type == 'Money') {
-          $data_type = "DECIMAL(10,2)";
-        }
-        elseif($data_type == 'Date') {
-          $data_type = 'datetime';
-        }
-        elseif($data_type == 'String') {
-          $data_type = 'varchar(128)';
-        }
-        $create_fields[] = "`$field_name` $data_type";
-      }
+      // Multi-trigger fields
+      foreach ($field_definition['triggers'] as $trigger) {
+        if($trigger['trigger_table'] == $trigger_table) {
+          $data_type = $field_definition['data_type'];
+          if($data_type == 'Money') {
+            $data_type = "DECIMAL(10,2)";
+          }
+          elseif($data_type == 'Date') {
+            $data_type = 'datetime';
+          }
+          elseif($data_type == 'String') {
+            $data_type = 'varchar(128)';
+          }
+          $create_fields[] = "`$field_name` $data_type";
+        } // foreach trigger_table
+      } // foreach trigger on field
     }
   }
   $sql = "CREATE TEMPORARY TABLE `$name` ( ".
@@ -473,7 +484,11 @@ function sumfields_generate_data_based_on_current_data($session = NULL) {
     if (!in_array($base_column_name, $active_fields)) {
       continue;
     }
-    $table = $custom['fields'][$base_column_name]['trigger_table'];
+
+    // Multi-trigger fields
+    foreach ($custom['fields'][$base_column_name]['triggers'] as $key => $trigger) {
+
+    $table = $trigger['trigger_table'];
     if (isset($custom['tables'][$table]['trigger_field'])) {
       $trigger_field = $custom['tables'][$table]['trigger_field'];
     }
@@ -482,17 +497,9 @@ function sumfields_generate_data_based_on_current_data($session = NULL) {
       $trigger_field = 'contact_id';
     }
 
-    $trigger = $custom['fields'][$base_column_name]['trigger_sql'];
-    // We replace NEW.contact_id with trigger_table.contact_id (or a custom field
-    // if the trigger table does not have contact_id) to reflect the difference
-    // between the trigger sql statement and the initial sql statement
-    // to load the data.
-    $trigger = str_replace('NEW.' . $trigger_field, 'trigger_table.' . $trigger_field, $trigger);
-    if (FALSE === $trigger = sumfields_sql_rewrite($trigger)) {
-      $msg = sprintf(E::ts("Failed to rewrite sql for %s field."), $base_column_name);
-      $session->setStatus($msg);
-      continue;
-    }
+    $sql = $trigger['trigger_sql'];
+
+    // Initialize with defaults, including creating a temporary table
     if (!isset($temp_sql[$table])) {
       $temp_sql[$table] = array(
         'temp_table' => sumfields_create_temporary_table($table),
@@ -500,8 +507,20 @@ function sumfields_generate_data_based_on_current_data($session = NULL) {
         'map' => array(),
       );
     }
-    $temp_sql[$table]['triggers'][$base_column_name] = $trigger;
+
+    // We replace NEW.contact_id with trigger_table.contact_id (or a custom field
+    // if the trigger table does not have contact_id) to reflect the difference
+    // between the trigger sql statement and the initial sql statement
+    // to load the data.
+    $sql = str_replace('NEW.' . $trigger_field, 'trigger_table.' . $trigger_field, $sql);
+    if (FALSE === $sql = sumfields_sql_rewrite($sql)) {
+      $msg = sprintf(E::ts("Failed to rewrite sql for %s field."), $base_column_name);
+      $session->setStatus($msg);
+      continue;
+    }
+    $temp_sql[$table]['triggers'][] = $sql;
     $temp_sql[$table]['map'][$base_column_name] = $params['column_name'];
+
     // If we have not yet set the initialize_join value for this table
     // then set it here.
     if (!isset($temp_sql[$table]['initialize_join'])) {
@@ -518,9 +537,9 @@ function sumfields_generate_data_based_on_current_data($session = NULL) {
         $temp_sql[$table]['initialize_join'] = NULL;
       }
     }
+    } // foreach trigger
 
   }
-
   if(empty($temp_sql)) {
     // Is this an error? Not sure. But it will be an error if we let this
     // function continue - it will produce a broken sql statement, so we
@@ -536,7 +555,6 @@ function sumfields_generate_data_based_on_current_data($session = NULL) {
       . " FROM `$table` AS trigger_table "
       . $data['initialize_join'] 
       . ' GROUP BY contact_id';
-
     CRM_Core_DAO::executeQuery($query);
 
     // Move temp data into custom field table
@@ -771,6 +789,25 @@ function sumfields_get_custom_field_definitions() {
         'is_view' => '1',
         'text_length' => '32',
       );
+
+      // Compatibility for single-trigger fields
+      if (isset($custom['fields'][$k]['trigger_table'])) {
+        // Allow for trigger_table and calculated_contact_id to be arrays, in which case multiple triggers are created:
+	// - stats on (contributions + soft credits) can use $trigger_table = ['civicrm_contribution', 'civicrm_contribution_soft'];
+	// - stats on relationships can use $calculated_contact_id = ['contact_id_a', 'contact_id_b'];
+        $tables = (is_array($v['trigger_table']) ? $v['trigger_table'] : array($v['trigger_table']));
+        $calculated_contact_id = CRM_Utils_Array::value('calculated_contact_id', $v, 'NEW.contact_id');
+	$cc_ids = (is_array($calculated_contact_id) ? $calculated_contact_id : array($calculated_contact_id));
+	foreach ($tables as $table) {
+	  foreach ($cc_ids as $cc_id) {
+            $custom['fields'][$k]['triggers'][] = [
+              'trigger_table' => $table,
+              'trigger_sql' => $v['trigger_sql'],
+              'calculated_contact_id' => $cc_id,
+            ];
+          }
+        }
+      }
       // Filter out any fields from tables that are not installed.
       if (isset($custom['optgroups'][$v['optgroup']]['component'])) {
         if (!sumfields_component_enabled($custom['optgroups'][$v['optgroup']]['component'])) {
@@ -1171,13 +1208,13 @@ function sumfields_alter_table() {
         }
       }
       catch (CiviCRM_API3_Exception $e) {
-        $session->setStatus(E::ts("Error deleting custom field '%1': %2"), array(1 => $field, 2 => $e->getMessage()));
+        $session->setStatus(E::ts("Error deleting custom field '%1': %2", array(1 => $field, 2 => $e->getMessage())));
         // This will result in a error, but let's continue anyway to see if we can get the rest of the fields
         // in working order.
         $ret = FALSE;
         continue;
       }
-      // $session->setStatus(E::ts("Deleted custom field '%1'"), array(1 => $field));
+      // $session->setStatus(E::ts("Deleted custom field '%1'", array(1 => $field)));
       unset($custom_field_parameters[$field]);
     }
   }
@@ -1203,11 +1240,11 @@ function sumfields_alter_table() {
         }
       }
       catch (CiviCRM_API3_Exception $e) {
-        $session->setStatus(E::ts("Error adding custom field '%1': %2"), array(1 => $field, 2 => $e->getMessage()));
+        $session->setStatus(E::ts("Error adding custom field '%1': %2", array(1 => $field, 2 => $e->getMessage())));
         $ret = FALSE;
         continue;
       }
-      // $session->setStatus(E::ts("Added custom field '%1'"), array(1 => $field));
+      // $session->setStatus(E::ts("Added custom field '%1'", array(1 => $field)));
       $value = array_pop($result['values']);
       $custom_field_parameters[$field] = array(
         'id' => $value['id'],
